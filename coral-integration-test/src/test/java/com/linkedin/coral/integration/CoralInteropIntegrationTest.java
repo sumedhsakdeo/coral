@@ -5,6 +5,9 @@
  */
 package com.linkedin.coral.integration;
 
+import java.util.List;
+
+import org.apache.avro.Schema;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.sql.type.SqlTypeName;
@@ -88,7 +91,190 @@ public class CoralInteropIntegrationTest extends CoralIntegrationTestBase {
     executeSql("DROP TABLE IF EXISTS iceberg_catalog.default.test_iceberg_table");
   }
 
+  @Test
+  public void testArrayAndMapWithSingleElementUnions() throws Exception {
+    // This test verifies that both table and view schemas match the original avro.schema.literal
+    // when array items and map values are defined as single-element unions in the base table's avro.schema.literal
+
+    // Define the Avro schema with:
+    // 1. Array items as a single-element union type: items = [{"type":"record",...}]
+    // 2. Map values as a single-element union type: values = [{"type":"record",...}]
+    // This reproduces the bug where single-element unions are not properly extracted
+    String originalAvroSchemaLiteral =
+        "{\"type\":\"record\",\"name\":\"test_complex_array_table\",\"namespace\":\"com.example.test\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":[\"null\",\"long\"],\"default\":null},"
+            + "{\"name\":\"entity_name\",\"type\":[\"null\",\"string\"],\"default\":null},"
+            + "{\"name\":\"items\",\"type\":[\"null\",{\"type\":\"array\",\"items\":[{\"type\":\"record\",\"name\":\"ItemConfig\",\"namespace\":\"com.example.data\",\"doc\":\"Configuration information for items.\",\"fields\":["
+            + "{\"name\":\"fooConfiguration\",\"type\":[\"null\",{\"type\":\"record\",\"name\":\"FooConfiguration\",\"doc\":\"Foo configuration details.\",\"fields\":["
+            + "{\"name\":\"name\",\"type\":\"string\",\"doc\":\"The name of the configuration\"},"
+            + "{\"name\":\"urlValue\",\"type\":\"string\",\"doc\":\"The URL value for the configuration\"},"
+            + "{\"name\":\"source\",\"type\":\"string\",\"doc\":\"The source of the configuration\"}"
+            + "]}],\"default\":null,\"doc\":\"Foo configuration details.\"},"
+            + "{\"name\":\"barConfiguration\",\"type\":[\"null\",{\"type\":\"record\",\"name\":\"BarConfiguration\",\"doc\":\"Bar configuration details.\",\"fields\":["
+            + "{\"name\":\"name\",\"type\":\"string\",\"doc\":\"The name of the configuration\"},"
+            + "{\"name\":\"domain\",\"type\":\"string\",\"doc\":\"The domain value\"}"
+            + "]}],\"default\":null,\"doc\":\"Bar configuration details.\"}"
+            + "]}]}],\"default\":null},"
+            + "{\"name\":\"metadata\",\"type\":[\"null\",{\"type\":\"map\",\"values\":[{\"type\":\"record\",\"name\":\"MetadataValue\",\"namespace\":\"com.example.data\",\"doc\":\"Metadata value record.\",\"fields\":["
+            + "{\"name\":\"category\",\"type\":\"string\",\"doc\":\"Category of metadata\"},"
+            + "{\"name\":\"priority\",\"type\":\"int\",\"doc\":\"Priority level\"}"
+            + "]}]}],\"default\":null}"
+            + "]}";
+
+    // Create an Iceberg table with the Avro schema
+    executeSql("CREATE TABLE IF NOT EXISTS iceberg_catalog.default.test_complex_array_table " + "(id BIGINT, "
+        + " entity_name STRING, " + " items ARRAY<STRUCT<"
+        + "   fooConfiguration: STRUCT<name: STRING, urlValue: STRING, source: STRING>, "
+        + "   barConfiguration: STRUCT<name: STRING, domain: STRING>" + " >>, "
+        + " metadata MAP<STRING, STRUCT<category: STRING, priority: INT>>" + ") " + "USING iceberg "
+        + "TBLPROPERTIES ('avro.schema.literal'='" + originalAvroSchemaLiteral + "')");
+
+    // Insert test data
+    executeSql("INSERT INTO iceberg_catalog.default.test_complex_array_table " + "SELECT 1L, 'EntityA', " + "  ARRAY("
+        + "    named_struct("
+        + "      'fooConfiguration', named_struct('name', 'Foo-Config-1', 'urlValue', 'https://example.com/foo', 'source', 'https://source.example.com'), "
+        + "      'barConfiguration', CAST(NULL AS STRUCT<name: STRING, domain: STRING>)" + "    )" + "  ), "
+        + "  map('key1', named_struct('category', 'test-category', 'priority', 1))");
+
+    // Verify data exists
+    executeSql("USE iceberg_catalog");
+    Dataset<Row> tblResult = spark.sql("SELECT * FROM default.test_complex_array_table");
+    assertEquals(tblResult.count(), 1, "Table should return 1 row");
+
+    // Create a view on top of the table
+    executeSql("CREATE OR REPLACE VIEW spark_catalog.default.complex_array_view AS "
+        + "SELECT * FROM default.test_complex_array_table");
+    executeSql("USE spark_catalog");
+    Dataset<Row> viewResult = spark.sql("SELECT * FROM default.complex_array_view");
+    assertEquals(viewResult.count(), 1, "View should return 1 row");
+
+    HiveMetastoreClient baseHmsClient = createCoralHiveMetastoreClient();
+
+    // Wrap the HMS client so that base table is forced to return `org.apache.hadoop.hive.serde2.avro.AvroSerDe` for serlializationLib
+    HiveMetastoreClient hiveMetastoreClient = new HiveMetastoreClient() {
+      @Override
+      public List<String> getAllDatabases() {
+        return baseHmsClient.getAllDatabases();
+      }
+
+      @Override
+      public org.apache.hadoop.hive.metastore.api.Database getDatabase(String dbName) {
+        return baseHmsClient.getDatabase(dbName);
+      }
+
+      @Override
+      public List<String> getAllTables(String dbName) {
+        return baseHmsClient.getAllTables(dbName);
+      }
+
+      @Override
+      public org.apache.hadoop.hive.metastore.api.Table getTable(String dbName, String tableName) {
+        org.apache.hadoop.hive.metastore.api.Table table = baseHmsClient.getTable(dbName, tableName);
+
+        // In prod, Iceberg tables often do not have AvroSerDe library set on storage descriptor, but have avro.schema.literal
+        if (table != null && table.getParameters() != null
+            && table.getParameters().containsKey("avro.schema.literal")) {
+          // Set AvroSerDe on the storage descriptor to null
+          if (table.getSd() != null) {
+            table.getSd().getSerdeInfo().setSerializationLib(null);
+            // Add the avro.schema.literal to SerDe parameters
+            table.getSd().getSerdeInfo().getParameters().put("avro.schema.literal",
+            originalAvroSchemaLiteral);
+          }
+        }
+
+        return table;
+      }
+    };
+
+    System.out.println("\n=== Testing Coral Schema Conversion ===");
+
+    // Parse the original Avro schema
+    Schema originalAvroSchema = new Schema.Parser().parse(originalAvroSchemaLiteral);
+
+    // Get view's Avro schema from Coral conversion
+    System.out.println("\n--- VIEW SCHEMA (from Coral ViewToAvroSchemaConverter) ---");
+    Schema viewAvroSchema = com.linkedin.coral.schema.avro.ViewToAvroSchemaConverter.create(hiveMetastoreClient)
+        .toAvroSchema("default", "complex_array_view", false, true);
+    System.out.println(viewAvroSchema.toString(true));
+
+    System.out.println("\n--- COMPARING fooConfiguration FIELD ---");
+
+    // Navigate to fooConfiguration in original schema
+    // Path: root -> items (union) -> array -> items (union) -> record -> fooConfiguration
+    Schema originalFooSchema = unwrapUnion(
+        unwrapUnion(unwrapUnion(originalAvroSchema.getField("items").schema()).getElementType())
+            .getField("fooConfiguration").schema());
+
+    // Navigate to fooConfiguration in view schema
+    Schema viewFooSchema = unwrapUnion(
+        unwrapUnion(unwrapUnion(viewAvroSchema.getField("items").schema()).getElementType())
+            .getField("fooconfiguration").schema());
+
+    // Compare the fooConfiguration schemas
+    System.out.println("\nOriginal fooConfiguration schema:");
+    System.out.println(originalFooSchema.toString(true));
+    System.out.println("\nView fooConfiguration schema:");
+    System.out.println(viewFooSchema.toString(true));
+
+    // Compare field by field; all 3 assertEquals used to fail due to the bug related to nullability
+    assertEquals(viewFooSchema.getField("name").schema(), originalFooSchema.getField("name").schema(),
+        "name field should match");
+    assertEquals(viewFooSchema.getField("urlvalue").schema(), originalFooSchema.getField("urlValue").schema(),
+        "urlValue field should match");
+    assertEquals(viewFooSchema.getField("source").schema(), originalFooSchema.getField("source").schema(),
+        "source field should match");
+
+    System.out.println("\n✓ fooConfiguration fields match!");
+
+    System.out.println("\n--- COMPARING metadata MAP VALUE ---");
+
+    // Navigate to metadata map value in original schema
+    // Path: root -> metadata (union) -> map -> values (union) -> record
+    Schema originalMetadataValueSchema = unwrapUnion(
+        unwrapUnion(originalAvroSchema.getField("metadata").schema()).getValueType());
+
+    // Navigate to metadata map value in view schema
+    Schema viewMetadataValueSchema = unwrapUnion(
+        unwrapUnion(viewAvroSchema.getField("metadata").schema()).getValueType());
+
+    // Compare the metadata value schemas
+    System.out.println("\nOriginal metadata value schema:");
+    System.out.println(originalMetadataValueSchema.toString(true));
+    System.out.println("\nView metadata value schema:");
+    System.out.println(viewMetadataValueSchema.toString(true));
+
+    // Compare field by field; both assertEquals used to fail due to the bug related to nullability
+    assertEquals(viewMetadataValueSchema.getField("category").schema(),
+        originalMetadataValueSchema.getField("category").schema(), "category field should match");
+    assertEquals(viewMetadataValueSchema.getField("priority").schema(),
+        originalMetadataValueSchema.getField("priority").schema(), "priority field should match");
+
+    System.out.println("\n✓ metadata map value fields match!");
+
+    // Clean up
+    executeSql("DROP VIEW IF EXISTS spark_catalog.default.complex_array_view");
+    executeSql("DROP TABLE IF EXISTS iceberg_catalog.default.test_complex_array_table");
+  }
+
   private RelNode getRelNode(String db, String view, HiveMetastoreClient hiveMetastoreClient) {
     return new HiveToRelConverter(hiveMetastoreClient).convertView(db, view);
+  }
+
+  /**
+   * Unwrap a union type to get the non-null type (assuming union of [null, Type]).
+   *
+   * @param schema The schema (potentially a union)
+   * @return The unwrapped schema
+   */
+  private Schema unwrapUnion(Schema schema) {
+    if (schema.getType() == Schema.Type.UNION) {
+      for (Schema type : schema.getTypes()) {
+        if (type.getType() != Schema.Type.NULL) {
+          return type;
+        }
+      }
+    }
+    return schema;
   }
 }
